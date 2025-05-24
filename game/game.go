@@ -311,15 +311,34 @@ func exploreAndEvaluateRecursive(grid *Grid, currentTile Coordinate, currentPath
 						}
 					}
 				}
-				scoredMoves = append(scoredMoves, ScoredMove{Coord: choice, IsStraight: isStraight, AdjacencyBonus: adjacencyBonus})
+
+				newForestCount := 0
+				for _, pForest := range choiceNeighbors { // Re-use choiceNeighbors for this count
+					if grid.isValidCoordinate(pForest) && grid[pForest.Y][pForest.X] == Empty {
+						newForestCount++
+					}
+				}
+
+				scoredMoves = append(scoredMoves, ScoredMove{Coord: choice, IsStraight: isStraight, AdjacencyBonus: adjacencyBonus, NewForestTilesCount: newForestCount})
 			}
 
-			// Sort scoredMoves: Primary: IsStraight (true first), Secondary: AdjacencyBonus (descending)
+			// Sort scoredMoves: Primary: AdjacencyBonus (desc), Secondary: NewForestTilesCount (desc), Tertiary: IsStraight (turns preferred)
 			sort.Slice(scoredMoves, func(i, j int) bool {
-				if scoredMoves[i].IsStraight != scoredMoves[j].IsStraight {
-					return scoredMoves[i].IsStraight // true (straight) comes before false (turn)
+				if scoredMoves[i].AdjacencyBonus != scoredMoves[j].AdjacencyBonus {
+					return scoredMoves[i].AdjacencyBonus > scoredMoves[j].AdjacencyBonus // Higher bonus first
 				}
-				return scoredMoves[i].AdjacencyBonus > scoredMoves[j].AdjacencyBonus // Higher bonus first
+				if scoredMoves[i].NewForestTilesCount != scoredMoves[j].NewForestTilesCount {
+					return scoredMoves[i].NewForestTilesCount > scoredMoves[j].NewForestTilesCount // Higher count first
+				}
+				// If other scores are equal, prefer turns (IsStraight = false) over straights (IsStraight = true).
+				// A turn (false) should come before a straight (true).
+				if scoredMoves[i].IsStraight == false && scoredMoves[j].IsStraight == true { // i is Turn, j is Straight
+					return true // i comes before j
+				}
+				if scoredMoves[i].IsStraight == true && scoredMoves[j].IsStraight == false { // i is Straight, j is Turn
+					return false // j comes before i
+				}
+				return false // Both are same (both turns or both straights), order doesn't matter for this criterion
 			})
 
 			// Explore sorted moves
@@ -428,7 +447,8 @@ func calculateProfitAndPlaceForests(gridWithRiver Grid, riverPath []Coordinate) 
 // TODO: Add functions for calculating profit based on a river path and forest placements
 
 type ScoredMove struct {
-	Coord          Coordinate
-	IsStraight     bool
-	AdjacencyBonus int
+	Coord               Coordinate
+	IsStraight          bool
+	AdjacencyBonus      int
+	NewForestTilesCount int
 }
