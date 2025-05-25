@@ -1,35 +1,24 @@
 package main
 
 import (
+	"bytes" // Needed for bytes.NewReader with the new clipboard library
 	"fmt"
 	"image"
-	"image/color" // Added for potential PNG image loading
-
-	// Added for saving PNG
+	"image/color" // Needed for decoding PNG from clipboard
 	"log"
-	"os" // Added for file operations
+	"os"
 	"riverplan/game"
 	"sync"
-	"time" // For a small delay in goroutine for visibility
+	"time"
+
+	// "github.com/atotto/clipboard" // Removing this library
+	"golang.design/x/clipboard" // Using this library instead for image support
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
-	"github.com/hajimehoshi/ebiten/v2/inpututil" // For key press detection
-	"github.com/sqweek/dialog"                   // Added for file dialogs
-	// For text rendering
-	// Basic font
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
+	"github.com/sqweek/dialog"
 )
-
-// Remove or comment out sampleRoad if not needed for testing
-/*
-var (
-	sampleRoad = []game.Coordinate{
-		{X: 5, Y: 5}, {X: 6, Y: 5}, {X: 7, Y: 5},
-		{X: 5, Y: 6}, {X: 7, Y: 6},
-		{X: 5, Y: 7}, {X: 6, Y: 7}, {X: 7, Y: 7},
-	}
-)
-*/
 
 const (
 	gameAreaWidth             = game.GridWidth * tileSize
@@ -586,11 +575,19 @@ func (g *Game) updateButtonsForState() {
 		})
 		g.buttons = append(g.buttons, Button{
 			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
-			Text: "Detect Road from Image",
+			Text: "Detect Road from Image File",
 			OnClick: func(g *Game) {
 				g.handleDetectRoadFromImage()
 			},
 		})
+		g.buttons = append(g.buttons, Button{
+			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
+			Text: "Detect from Clipboard",
+			OnClick: func(g *Game) {
+				g.handleDetectRoadFromClipboard()
+			},
+		})
+		// Ensure no trailing comma here before the next button or end of list
 		g.buttons = append(g.buttons, Button{
 			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
 			Text: "Finalize Road & Select Source",
@@ -809,9 +806,7 @@ func (g *Game) updateButtonsForState() {
 						g.updateButtonsForState()
 						g.updateCalculationStatus()
 					}
-				} else {
-					fmt.Printf("[SIMPLIFIED DEBUG] Clicked Stop but not in StateCalculating (State is %v). This shouldn't happen if buttons are correct.\\n", g.gameState)
-				}
+				} // Closes if g.gameState == StateCalculating
 			},
 		})
 
@@ -1246,6 +1241,74 @@ func (g *Game) handleDetectRoadFromImage() {
 	g.updateCalculationStatus() // To show new status
 }
 
+// processDetectedImage takes a captured/loaded image, crops it, and runs road detection.
+// It updates the game state with the detected road layout.
+func (g *Game) processDetectedImage(fullImg image.Image, sourceDescription string) {
+	img, err := detectAndCropGrid(fullImg)
+	if err != nil {
+		log.Printf("Error detecting/cropping game grid from %s: %v", sourceDescription, err)
+		g.calculationStatus = fmt.Sprintf("Grid Detect Err from %s: %v", sourceDescription, err)
+		return
+	}
+
+	bounds := img.Bounds()
+	imgWidth := float64(bounds.Dx())
+	imgHeight := float64(bounds.Dy())
+
+	cellWidth := imgWidth / float64(game.GridWidth)
+	cellHeight := imgHeight / float64(game.GridHeight)
+
+	if cellWidth <= 0 || cellHeight <= 0 {
+		log.Printf("Error: Image dimensions (%dx%d) from %s result in zero or negative cell size.", bounds.Dx(), bounds.Dy(), sourceDescription)
+		g.calculationStatus = fmt.Sprintf("Error: Invalid image dimensions for grid from %s.", sourceDescription)
+		return
+	}
+
+	detectedRoadTiles := []game.Coordinate{}
+
+	const sampleAreaSize = 4
+	targetCellX_ref := int((0.0 + 0.3) * cellWidth)
+	targetCellY_ref := int((0.0 + 0.3) * cellHeight)
+	referenceRect := image.Rect(
+		targetCellX_ref-sampleAreaSize/2,
+		targetCellY_ref-sampleAreaSize/2,
+		targetCellX_ref+sampleAreaSize/2,
+		targetCellY_ref+sampleAreaSize/2,
+	)
+	referenceBrightness := getAverageBrightness(img, referenceRect)
+
+	for y := 0; y < game.GridHeight-1; y++ {
+		for x := 0; x < game.GridWidth; x++ {
+			sampleCX := int((float64(x) + 0.3) * cellWidth)
+			sampleCY := int((float64(y) + 0.3) * cellHeight)
+			currentTileSampleRect := image.Rect(
+				sampleCX-sampleAreaSize/2,
+				sampleCY-sampleAreaSize/2,
+				sampleCX+sampleAreaSize/2,
+				sampleCY+sampleAreaSize/2,
+			)
+			currentTileBrightness := getAverageBrightness(img, currentTileSampleRect)
+			if currentTileBrightness > referenceBrightness+brightnessDifferenceThreshold {
+				detectedRoadTiles = append(detectedRoadTiles, game.Coordinate{X: x, Y: y})
+			}
+		}
+	}
+
+	g.grid = game.NewGrid()
+	g.grid.SetRoad(detectedRoadTiles)
+	g.roadLayoutGrid = g.grid
+	g.finalBestSolution.Grid = g.grid
+	g.finalBestSolution.Profit = -1.0
+	g.finalBestSolution.Path = nil
+	g.intermediateBestSolution = g.finalBestSolution
+	g.overallBestSolutionInIterativeRun = game.RiverPathSolution{Grid: g.grid, Profit: -1.0, Path: nil}
+
+	log.Printf("Detected %d road tiles from %s.", len(detectedRoadTiles), sourceDescription)
+	g.calculationStatus = fmt.Sprintf("Detected %d road tiles from %s. Finalize or edit.", len(detectedRoadTiles), sourceDescription)
+	g.updateButtonsForState()
+	g.updateCalculationStatus()
+}
+
 // abs is a helper function for absolute integer value.
 func abs(x int) int {
 	if x < 0 {
@@ -1293,6 +1356,51 @@ func getAverageBrightness(img image.Image, relativeRect image.Rectangle) float64
 		return 0.0 // Avoid division by zero; or handle as an error
 	}
 	return totalBrightness / float64(count)
+}
+
+// handleDetectRoadFromClipboard attempts to read an image from the clipboard
+// and then process it for road detection.
+func (g *Game) handleDetectRoadFromClipboard() {
+	log.Println("Attempting to detect road from clipboard using golang.design/x/clipboard...")
+
+	err := clipboard.Init()
+	if err != nil {
+		log.Printf("Error initializing clipboard (golang.design/x/clipboard): %v", err)
+		g.calculationStatus = fmt.Sprintf("Clipboard Init Err: %v", err)
+		g.updateCalculationStatus()
+		return
+	}
+
+	// Read image data from clipboard. This expects PNG encoded bytes.
+	// clipboard.Read does not return an error itself; errors should be caught by Init().
+	imgBytes := clipboard.Read(clipboard.FmtImage)
+
+	if len(imgBytes) == 0 {
+		log.Println("Clipboard is empty or contains no image data in a recognized format (PNG), or Init failed previously.")
+		g.calculationStatus = "Error: Clipboard empty or no PNG image."
+		g.updateCalculationStatus()
+		return
+	}
+
+	imgReader := bytes.NewReader(imgBytes)
+	clipboardImage, format, err := image.Decode(imgReader)
+	if err != nil {
+		log.Printf("Error decoding image from clipboard: %v. Length of data: %d", err, len(imgBytes))
+		g.calculationStatus = "Error: Failed to decode clipboard image (was it PNG?)."
+		g.updateCalculationStatus()
+		return
+	}
+
+	log.Printf("Successfully read and decoded image from clipboard. Format: %s", format)
+	g.processDetectedImage(clipboardImage, "clipboard (golang.design)")
+}
+
+// min helper function (if not already present elsewhere)
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {
