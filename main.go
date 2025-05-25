@@ -3,8 +3,11 @@ package main
 import (
 	"fmt"
 	"image"
-	"image/color"
+	"image/color" // Added for potential PNG image loading
+
+	// Added for saving PNG
 	"log"
+	"os" // Added for file operations
 	"riverplan/game"
 	"sync"
 	"time" // For a small delay in goroutine for visibility
@@ -12,6 +15,7 @@ import (
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil" // For key press detection
+	"github.com/sqweek/dialog"                   // Added for file dialogs
 	// For text rendering
 	// Basic font
 )
@@ -35,6 +39,38 @@ const (
 	minRiverLength            = 5
 	maxRiverLengthCap         = 35 // Absolute cap for slider adjustment (CHANGED FROM 100 to 35)
 	defaultInitialRiverLength = 35
+	// brightnessDifferenceThreshold is the amount by which a tile's brightness must exceed the
+	// reference tile's brightness to be considered a road.
+	brightnessDifferenceThreshold = 15.0
+
+	// Define the target road color (Loop Hero roads are brownish-yellow)
+	// This might need adjustment. Let's start with a sample color.
+	// Values are R, G, B (0-255).
+	// roadColorR = 110 // Adjusted based on user screenshot - NO LONGER USED
+	// roadColorG = 110 // Adjusted based on user screenshot - NO LONGER USED
+	// roadColorB = 110 // Adjusted based on user screenshot - NO LONGER USED
+	// Threshold for color matching (sum of absolute differences in R, G, B values)
+	// colorThreshold = 70 // Adjusted: Made stricter to avoid non-road tiles like campfire - NO LONGER USED
+
+	// Anchor colors for grid detection
+	anchorDarkGrayR      = 58  // Reverted to user-specified #3A3F3F for top-left
+	anchorDarkGrayG      = 63  // Reverted to user-specified #3A3F3F for top-left
+	anchorDarkGrayB      = 63  // Reverted to user-specified #3A3F3F for top-left
+	anchorGreenPatternR  = 142 // User-specified #8E8F7B for top-right
+	anchorGreenPatternG  = 143 // User-specified #8E8F7B for top-right
+	anchorGreenPatternB  = 123 // User-specified #8E8F7B for top-right
+	anchorColorThreshold = 30  // Threshold for matching anchor colors (can be tuned)
+
+	// Percentage-based grid coordinates (derived from 2560x1440 example)
+	// Top-left X of grid = 0px -> 0%
+	// Top-left Y of grid = 100px -> 100/1440 = 6.944%
+	// Top-right X of grid = 2099px -> 2099/2560 = 81.99%
+	// Grid bottom Y: TopY_px + ( (TopRightX_px - TopLeftX_px)/21 tiles * 12 tiles ) = 100 + ( (2099-0)/21 * 12 ) = 100 + 1199.428 = 1299.428px
+	//                 1299.428px / 1440px height = 90.2379...%
+	gridStartXPercent  = 0.0
+	gridStartYPercent  = 0.0694444444
+	gridEndXPercent    = 0.819921875
+	gridBottomYPercent = 0.9023791667
 
 	// UI Button constants
 	// panelWidth, buttonHeight, buttonMargin, buttonPadding, textOffsetY moved to ui.go
@@ -550,6 +586,13 @@ func (g *Game) updateButtonsForState() {
 		})
 		g.buttons = append(g.buttons, Button{
 			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
+			Text: "Detect Road from Image",
+			OnClick: func(g *Game) {
+				g.handleDetectRoadFromImage()
+			},
+		})
+		g.buttons = append(g.buttons, Button{
+			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
 			Text: "Finalize Road & Select Source",
 			OnClick: func(g *Game) {
 				g.roadLayoutGrid = g.grid
@@ -748,7 +791,7 @@ func (g *Game) updateButtonsForState() {
 			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
 			Text: "Stop Calculation",
 			OnClick: func(g *Game) {
-				fmt.Printf("[SIMPLIFIED DEBUG] Stop Calculation button clicked. Current state: %v, g.stopCalcChannel: %p\\\\n", g.gameState, g.stopCalcChannel)
+				fmt.Printf("[SIMPLIFIED DEBUG] Stop Calculation button clicked. Current state: %v, g.stopCalcChannel: %p\\n", g.gameState, g.stopCalcChannel)
 				if g.gameState == StateCalculating {
 					if g.stopCalcChannel != nil {
 						fmt.Println("[SIMPLIFIED DEBUG] Closing stopCalcChannel.")
@@ -767,7 +810,7 @@ func (g *Game) updateButtonsForState() {
 						g.updateCalculationStatus()
 					}
 				} else {
-					fmt.Printf("[SIMPLIFIED DEBUG] Clicked Stop but not in StateCalculating (State is %v). This shouldn't happen if buttons are correct.\\\\n", g.gameState)
+					fmt.Printf("[SIMPLIFIED DEBUG] Clicked Stop but not in StateCalculating (State is %v). This shouldn't happen if buttons are correct.\\n", g.gameState)
 				}
 			},
 		})
@@ -1020,6 +1063,236 @@ func (g *Game) resetButtonAction(resetType string) {
 	}
 	g.updateButtonsForState()   // Refresh buttons for the new state
 	g.updateCalculationStatus() // Refresh status message
+}
+
+// detectAndCropGrid attempts to find the 12x21 game grid within a larger image and returns the cropped grid.
+func detectAndCropGrid(fullImage image.Image) (image.Image, error) {
+	imgBounds := fullImage.Bounds()
+	imgWidth := float64(imgBounds.Dx())
+	imgHeight := float64(imgBounds.Dy())
+
+	if imgWidth == 0 || imgHeight == 0 {
+		return nil, fmt.Errorf("input image has zero width or height")
+	}
+
+	// Calculate pixel coordinates from percentages
+	gridStartX := int(imgWidth * gridStartXPercent)
+	gridStartY := int(imgHeight * gridStartYPercent)
+	gridEndX := int(imgWidth * gridEndXPercent)
+	gridBottomY := int(imgHeight * gridBottomYPercent)
+
+	gridPixelWidth := gridEndX - gridStartX
+	gridPixelHeight := gridBottomY - gridStartY
+
+	if gridPixelWidth <= 0 || gridPixelHeight <= 0 {
+		return nil, fmt.Errorf("calculated grid pixel width (%.0f) or height (%.0f) is zero or negative. Image: %.0fx%.0f. Percentages: X(%.2f-%.2f) Y(%.2f-%.2f)",
+			float64(gridPixelWidth), float64(gridPixelHeight), imgWidth, imgHeight, gridStartXPercent*100, gridEndXPercent*100, gridStartYPercent*100, gridBottomYPercent*100)
+	}
+
+	// Define the crop rectangle
+	cropRect := image.Rect(gridStartX, gridStartY, gridEndX, gridBottomY)
+
+	log.Printf("Calculated crop rectangle: %+v (from ImgSize: %.0fx%.0f)", cropRect, imgWidth, imgHeight)
+
+	// Check if cropRect is valid and within the bounds of the original image
+	if !cropRect.In(imgBounds) && (cropRect.Min.X != imgBounds.Min.X || cropRect.Min.Y != imgBounds.Min.Y || cropRect.Max.X != imgBounds.Max.X || cropRect.Max.Y != imgBounds.Max.Y) {
+		// It's okay if the calculated rect is IDENTICAL to imgBounds (e.g. if percentages are 0-100 for a pre-cropped image)
+		// But if it's different AND not fully contained, it's an error.
+		// We also need to handle potential off-by-one from float to int conversions if rect is almost full image size
+		// A more lenient check might be needed if rounding causes issues near image edges
+		actualImgBoundsForCheck := imgBounds
+		if cropRect.Min.X >= actualImgBoundsForCheck.Max.X ||
+			cropRect.Min.Y >= actualImgBoundsForCheck.Max.Y ||
+			cropRect.Max.X <= actualImgBoundsForCheck.Min.X ||
+			cropRect.Max.Y <= actualImgBoundsForCheck.Min.Y ||
+			cropRect.Min.X < actualImgBoundsForCheck.Min.X ||
+			cropRect.Min.Y < actualImgBoundsForCheck.Min.Y ||
+			cropRect.Max.X > actualImgBoundsForCheck.Max.X ||
+			cropRect.Max.Y > actualImgBoundsForCheck.Max.Y {
+			return nil, fmt.Errorf("calculated crop rectangle %+v is outside image bounds %+v", cropRect, actualImgBoundsForCheck)
+		}
+		log.Printf("Warning: Crop rectangle %+v not strictly 'In' image bounds %+v, but seems valid due to edge calculations.", cropRect, actualImgBoundsForCheck)
+	}
+
+	// Crop the image
+	subImager, ok := fullImage.(interface {
+		SubImage(r image.Rectangle) image.Image
+	})
+	if !ok {
+		return nil, fmt.Errorf("image type does not support SubImage operation")
+	}
+	croppedImage := subImager.SubImage(cropRect)
+	log.Printf("Successfully cropped grid using percentages. Original: %.0fx%.0f, CropRect: %+v, Cropped: %dx%d",
+		imgWidth, imgHeight, cropRect, croppedImage.Bounds().Dx(), croppedImage.Bounds().Dy())
+	return croppedImage, nil
+}
+
+func (g *Game) handleDetectRoadFromImage() {
+	filePath, err := dialog.File().Filter("PNG Images", "png").Load()
+	if err != nil {
+		if err == dialog.Cancelled {
+			log.Println("File selection cancelled.")
+		} else {
+			log.Printf("Error opening file dialog: %v", err)
+			g.calculationStatus = "Error: Could not open image."
+		}
+		return
+	}
+
+	log.Printf("Selected file: %s", filePath)
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("Error opening image file '%s': %v", filePath, err)
+		g.calculationStatus = fmt.Sprintf("Error: Failed to open %s", filePath)
+		return
+	}
+	defer file.Close()
+
+	fullImg, _, err := image.Decode(file) // Underscore for format string as we don't need it
+	if err != nil {
+		log.Printf("Error decoding image file '%s': %v", filePath, err)
+		g.calculationStatus = fmt.Sprintf("Error: Failed to decode %s", filePath)
+		return
+	}
+
+	// New Step: Detect and crop the grid from the full image
+	img, err := detectAndCropGrid(fullImg)
+	if err != nil {
+		log.Printf("Error detecting/cropping game grid: %v", err)
+		g.calculationStatus = fmt.Sprintf("Grid Detect Err: %v", err)
+		return // Don't proceed if grid detection failed
+	}
+
+	bounds := img.Bounds()
+	imgWidth := float64(bounds.Dx())  // This is cropped image width
+	imgHeight := float64(bounds.Dy()) // This is cropped image height
+
+	// Calculate cell dimensions from the image size.
+	cellWidth := imgWidth / float64(game.GridWidth)
+	cellHeight := imgHeight / float64(game.GridHeight)
+
+	if cellWidth <= 0 || cellHeight <= 0 {
+		log.Printf("Error: Image dimensions (%dx%d) result in zero or negative cell size.", bounds.Dx(), bounds.Dy())
+		g.calculationStatus = "Error: Invalid image dimensions for grid."
+		return
+	}
+
+	detectedRoadTiles := []game.Coordinate{}
+
+	// --- New brightness-based road detection ---
+	// 1. Determine the reference brightness from the top-left tile (0,0)
+	const sampleAreaSize = 4 // Sample a 4x4 area
+
+	// Calculate center of the top-left tile (0,0) in terms of image content coordinates
+	// Shifted sampling point closer to top-left (0.3, 0.3 relative offset)
+	targetCellX_ref := int((0.0 + 0.3) * cellWidth)
+	targetCellY_ref := int((0.0 + 0.3) * cellHeight)
+
+	// Define the 4x4 sampling rectangle for the reference tile, relative to image content top-left (0,0)
+	referenceRect := image.Rect(
+		targetCellX_ref-sampleAreaSize/2,
+		targetCellY_ref-sampleAreaSize/2,
+		targetCellX_ref+sampleAreaSize/2,
+		targetCellY_ref+sampleAreaSize/2,
+	)
+	referenceBrightness := getAverageBrightness(img, referenceRect)
+	// log.Printf("Reference brightness (tile 0,0): %.2f from rect %+v", referenceBrightness, referenceRect) // Removed unnecessary log
+
+	// 2. Iterate through all tiles and compare their brightness to the reference
+	//    excluding the bottom row (y from 0 to game.GridHeight-2)
+	for y := 0; y < game.GridHeight-1; y++ {
+		for x := 0; x < game.GridWidth; x++ {
+			// Calculate the center pixel of the current cell in the image content
+			// Shifted sampling point closer to top-left (0.3, 0.3 relative offset)
+			sampleCX := int((float64(x) + 0.3) * cellWidth)
+			sampleCY := int((float64(y) + 0.3) * cellHeight)
+
+			// Define the 4x4 sampling rectangle for the current tile, relative to image content top-left (0,0)
+			currentTileSampleRect := image.Rect(
+				sampleCX-sampleAreaSize/2,
+				sampleCY-sampleAreaSize/2,
+				sampleCX+sampleAreaSize/2,
+				sampleCY+sampleAreaSize/2,
+			)
+
+			currentTileBrightness := getAverageBrightness(img, currentTileSampleRect)
+
+			// If current tile is brighter than reference + threshold, consider it a road
+			if currentTileBrightness > referenceBrightness+brightnessDifferenceThreshold {
+				detectedRoadTiles = append(detectedRoadTiles, game.Coordinate{X: x, Y: y})
+				// log.Printf("Tile (%d,%d) is ROAD. Brightness: %.2f (Ref: %.2f + Thresh: %.2f). Rect: %+v", x, y, currentTileBrightness, referenceBrightness, brightnessDifferenceThreshold, currentTileSampleRect) // Removed unnecessary log
+			} else {
+				// log.Printf("Tile (%d,%d) is NOT ROAD. Brightness: %.2f (Ref: %.2f + Thresh: %.2f). Rect: %+v", x, y, currentTileBrightness, referenceBrightness, brightnessDifferenceThreshold, currentTileSampleRect) // Removed unnecessary log
+			}
+		}
+	}
+	// --- End new brightness-based road detection ---
+
+	g.grid = game.NewGrid() // Clear existing grid before applying new roads
+	g.grid.SetRoad(detectedRoadTiles)
+
+	// Update related game state after road detection
+	g.roadLayoutGrid = g.grid // Store this as the base road layout for calculations
+	g.finalBestSolution.Grid = g.grid
+	g.finalBestSolution.Profit = -1.0
+	g.finalBestSolution.Path = nil
+	g.intermediateBestSolution = g.finalBestSolution
+	g.overallBestSolutionInIterativeRun = game.RiverPathSolution{Grid: g.grid, Profit: -1.0, Path: nil}
+
+	log.Printf("Detected %d road tiles from image.", len(detectedRoadTiles))
+	g.calculationStatus = fmt.Sprintf("Detected %d road tiles. Finalize or edit.", len(detectedRoadTiles))
+	g.updateButtonsForState()   // To refresh UI if needed (e.g., button states)
+	g.updateCalculationStatus() // To show new status
+}
+
+// abs is a helper function for absolute integer value.
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// getAverageBrightness calculates the average brightness of pixels within a given rectangle in an image.
+// The relativeRect's coordinates are 0-indexed relative to the logical top-left of the img's content.
+func getAverageBrightness(img image.Image, relativeRect image.Rectangle) float64 {
+	var totalBrightness float64
+	var count int
+
+	imgBounds := img.Bounds()
+	imgContentWidth := imgBounds.Dx()
+	imgContentHeight := imgBounds.Dy()
+
+	// Iterate over the pixels in the relativeRect
+	for ry := relativeRect.Min.Y; ry < relativeRect.Max.Y; ry++ {
+		for rx := relativeRect.Min.X; rx < relativeRect.Max.X; rx++ {
+			// Check if the relative coordinates (rx, ry) are within the image's content dimensions
+			if rx >= 0 && rx < imgContentWidth && ry >= 0 && ry < imgContentHeight {
+				// Convert relative (rx, ry) to absolute coordinates for img.At()
+				absX := imgBounds.Min.X + rx
+				absY := imgBounds.Min.Y + ry
+
+				pixelColor := img.At(absX, absY)
+				r, g, b, _ := pixelColor.RGBA() // Returns values in [0, 0xffff] range
+
+				// Convert to 0-255 range
+				r8 := uint8(r >> 8)
+				g8 := uint8(g >> 8)
+				b8 := uint8(b >> 8)
+
+				// Calculate brightness for this pixel (simple average)
+				brightness := (float64(r8) + float64(g8) + float64(b8)) / 3.0
+				totalBrightness += brightness
+				count++
+			}
+		}
+	}
+
+	if count == 0 {
+		return 0.0 // Avoid division by zero; or handle as an error
+	}
+	return totalBrightness / float64(count)
 }
 
 func main() {
