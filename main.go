@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"riverplan/game"
+	"runtime" // Added import
 	"sync"
 	"time"
 
@@ -79,12 +80,12 @@ const (
 
 // Game implements ebiten.Game interface.
 type Game struct {
-	grid                            game.Grid // Current working grid, might show intermediate or final results
-	roadLayoutGrid                  game.Grid // Stores the grid with only roads and forbidden tiles
-	gameState                       GameState
-	calculationStatus               string
-	finalBestSolution               game.RiverPathSolution
-	intermediateBestSolution        game.RiverPathSolution // Overall best intermediate solution
+	grid              game.Grid // Current working grid, might show intermediate or final results
+	roadLayoutGrid    game.Grid // Stores the grid with only roads and forbidden tiles
+	gameState         GameState
+	calculationStatus string
+	finalBestSolution game.RiverPathSolution
+	// intermediateBestSolution        game.RiverPathSolution // Overall best intermediate solution // REMOVED
 	selectedRiverStart              game.Coordinate
 	validRiverStarts                []game.Coordinate // To highlight valid spots for user
 	calculationStartTime            time.Time
@@ -95,10 +96,12 @@ type Game struct {
 	DisableCrossRiverAdjacency      bool          // New: Toggle for cross-river adjacency rule
 	mu                              sync.Mutex
 
-	// Fields for iterative calculation state management
-	isIterativeCalculationActive      bool
-	currentLengthBeingTested          int
-	overallBestSolutionInIterativeRun game.RiverPathSolution
+	// Fields for global iterative calculation state management
+	absoluteBestOverallSolution game.RiverPathSolution // Best solution found across all goroutines
+	activeCalculationGoroutines sync.WaitGroup         // To track active worker goroutines
+	calculationID               int                    // Incremental ID for each calculation run
+	currentCalculationID        int                    // ID of the currently active calculation sweep
+	numWorkersForCurrentCalc    int                    // Number of workers launched for the current calculation (1 for single, N for global)
 
 	// UI elements - can be dynamic based on state
 	buttons []Button
@@ -117,23 +120,27 @@ type Game struct {
 // NewGame initializes a new game instance.
 func NewGame() *Game {
 	g := &Game{
-		grid:                              game.NewGrid(),
-		roadLayoutGrid:                    game.NewGrid(), // Initially empty
-		gameState:                         StatePlacingRoad,
-		currentMaxRiverLength:             defaultInitialRiverLength,
-		lengthUsedForCurrentCalculation:   defaultInitialRiverLength, // Initialize
-		maxLenUsedForFinalSolution:        0,                         // No solution yet
-		DisableCrossRiverAdjacency:        false,                     // Default for the new toggle
-		isIterativeCalculationActive:      false,
-		currentLengthBeingTested:          0,
-		overallBestSolutionInIterativeRun: game.RiverPathSolution{Profit: -1.0},
+		grid:                            game.NewGrid(),
+		roadLayoutGrid:                  game.NewGrid(), // Initially empty
+		gameState:                       StatePlacingRoad,
+		currentMaxRiverLength:           defaultInitialRiverLength,
+		lengthUsedForCurrentCalculation: defaultInitialRiverLength, // Initialize
+		maxLenUsedForFinalSolution:      0,                         // No solution yet
+		DisableCrossRiverAdjacency:      false,                     // Default for the new toggle
+		// isIterativeCalculationActive:      false, // REMOVED
+		// currentLengthBeingTested:          0, // REMOVED
+		// overallBestSolutionInIterativeRun: game.RiverPathSolution{Profit: -1.0}, // REMOVED
+		absoluteBestOverallSolution: game.RiverPathSolution{Profit: -1.0, Grid: game.NewGrid()}, // Initialize with new grid
+		calculationID:               0,
+		currentCalculationID:        0,
+		numWorkersForCurrentCalc:    0, // Initialize
 	}
 	// Initialize solutions with the empty grid state
 	g.finalBestSolution.Grid = g.grid
 	g.finalBestSolution.Profit = -1.0
-	g.intermediateBestSolution.Grid = g.grid
-	g.intermediateBestSolution.Profit = -1.0
-	g.overallBestSolutionInIterativeRun.Grid = g.grid
+	// g.intermediateBestSolution.Grid = g.grid // REMOVED
+	// g.intermediateBestSolution.Profit = -1.0 // REMOVED
+	// g.absoluteBestOverallSolution.Grid = g.grid // Initialize with current grid // Corrected above
 	g.updateButtonsForState()   // Initialize buttons
 	g.updateCalculationStatus() // Initialize status
 	return g
@@ -153,32 +160,29 @@ func (g *Game) updateCalculationStatus() {
 		}
 		g.calculationStatus = statusText
 	case StateCalculating:
-		if g.isIterativeCalculationActive {
-			status := fmt.Sprintf("Iterative Calc (Max %d):\n", g.lengthUsedForCurrentCalculation)
-			status += fmt.Sprintf("Testing Len: %d / %d\n", g.currentLengthBeingTested, g.lengthUsedForCurrentCalculation)
-			profitCurrentTest := 0.0
-			if g.intermediateBestSolution.Profit >= 0 {
-				profitCurrentTest = g.intermediateBestSolution.Profit * 100
-			}
-			status += fmt.Sprintf("Cur Best: %.2f%% (Path %d)\n", profitCurrentTest, len(g.intermediateBestSolution.Path))
-			profitOverall := 0.0
-			if g.overallBestSolutionInIterativeRun.Profit >= 0 {
-				profitOverall = g.overallBestSolutionInIterativeRun.Profit * 100
-			}
-			status += fmt.Sprintf("Overall Best: %.2f%% (Path %d)\n", profitOverall, len(g.overallBestSolutionInIterativeRun.Path))
-			status += fmt.Sprintf("(%.1fs)", time.Since(g.calculationStartTime).Seconds())
-			g.calculationStatus = status
-		} else { // Original non-iterative status, can be kept as fallback or removed if iterative is always used
-			profit := g.intermediateBestSolution.Profit
-			if profit < 0 {
-				profit = 0
-			}
-			g.calculationStatus = fmt.Sprintf("Calculating (MaxLen %d)...\nBest: %.2f%% (Path: %d)\n(%.1fs).",
-				g.lengthUsedForCurrentCalculation,
-				profit*100,
-				len(g.intermediateBestSolution.Path),
-				time.Since(g.calculationStartTime).Seconds())
+		scanType := "Global Scan"
+		if g.numWorkersForCurrentCalc == 1 {
+			scanType = "Selected Start Scan"
 		}
+		status := fmt.Sprintf("%s (Max %d):\n", scanType, g.lengthUsedForCurrentCalculation)
+		status += fmt.Sprintf("Scanning %d start(s) (Adj: %t)\n", g.numWorkersForCurrentCalc, g.DisableCrossRiverAdjacency)
+
+		profitOverall := 0.0
+		pathLenOverall := 0
+		var pathStart game.Coordinate
+
+		if g.absoluteBestOverallSolution.Profit >= 0 && g.absoluteBestOverallSolution.Path != nil && len(g.absoluteBestOverallSolution.Path) > 0 {
+			profitOverall = g.absoluteBestOverallSolution.Profit * 100
+			pathLenOverall = len(g.absoluteBestOverallSolution.Path)
+			pathStart = g.absoluteBestOverallSolution.Path[0]
+			status += fmt.Sprintf("Best Found: %.2f%% (Path %d)\n", profitOverall, pathLenOverall)
+			status += fmt.Sprintf("From Start: (%d,%d)\n", pathStart.X, pathStart.Y)
+		} else {
+			status += "Best Found: None yet\n"
+		}
+		status += fmt.Sprintf("(%.1fs)", time.Since(g.calculationStartTime).Seconds())
+		g.calculationStatus = status
+
 	case StateShowingResult:
 		profit := g.finalBestSolution.Profit
 		if profit < 0 {
@@ -291,7 +295,7 @@ func (g *Game) Update() error {
 						g.finalBestSolution.Grid = g.grid
 						g.finalBestSolution.Profit = -1.0
 						g.finalBestSolution.Path = nil
-						g.intermediateBestSolution = g.finalBestSolution
+						// g.intermediateBestSolution = g.finalBestSolution // REMOVED
 					}
 				}
 			case StatePlacingRiverSource:
@@ -303,10 +307,10 @@ func (g *Game) Update() error {
 						break
 					}
 				}
-				fmt.Printf("[DEBUG] Grid click in StatePlacingRiverSource. Clicked: (%d,%d), IsValidSoFar: %t, NumValidStarts: %d\\n", clickedCoord.X, clickedCoord.Y, isValidSource, len(g.validRiverStarts))
+				fmt.Printf("[DEBUG] Grid click in StatePlacingRiverSource. Clicked: (%d,%d), IsValidSoFar: %t, NumValidStarts: %d\n", clickedCoord.X, clickedCoord.Y, isValidSource, len(g.validRiverStarts))
 				if isValidSource {
 					g.selectedRiverStart = clickedCoord
-					fmt.Printf("[DEBUG] River source selected by grid click: (%d, %d)\\\\n", g.selectedRiverStart.X, g.selectedRiverStart.Y)
+					fmt.Printf("[DEBUG] River source selected by grid click: (%d, %d)\n", g.selectedRiverStart.X, g.selectedRiverStart.Y)
 					g.updateCalculationStatus() // Update status to show selected start, e.g., "Selected Start: (X,Y)"
 					g.updateButtonsForState()   // Update buttons, e.g., "Start Calculation" button might become fully enabled or change text
 				}
@@ -373,7 +377,7 @@ func (g *Game) Update() error {
 					g.finalBestSolution.Grid = g.grid
 					g.finalBestSolution.Profit = -1.0
 					g.finalBestSolution.Path = nil
-					g.intermediateBestSolution = g.finalBestSolution
+					// g.intermediateBestSolution = g.finalBestSolution // REMOVED
 				}
 			}
 		}
@@ -404,10 +408,10 @@ func (g *Game) Update() error {
 			g.gameState = StatePlacingRiverSource
 			g.grid = g.roadLayoutGrid // Ensure grid shows road layout
 			g.validRiverStarts = g.roadLayoutGrid.GetValidRiverStarts()
-			g.intermediateBestSolution.Grid = g.roadLayoutGrid
-			g.intermediateBestSolution.Path = nil
-			g.intermediateBestSolution.Profit = -1.0
-			g.finalBestSolution = g.intermediateBestSolution // Clear final solution as well
+			// g.intermediateBestSolution.Grid = g.roadLayoutGrid // REMOVED
+			// g.intermediateBestSolution.Path = nil // REMOVED
+			// g.finalBestSolution = g.intermediateBestSolution // REMOVED
+			g.finalBestSolution = g.absoluteBestOverallSolution // Clear final solution as well
 			g.maxLenUsedForFinalSolution = 0
 			g.selectedRiverStart = game.Coordinate{} // Clear selected start, user needs to pick again
 			fmt.Println("Escape pressed: Returning to River Source Selection.")
@@ -434,7 +438,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		tempButtonTexts = append(tempButtonTexts, btn.Text)
 	}
 	// Commenting out for cleaner logs unless specifically debugging button presence issues.
-	// fmt.Printf("[DRAW DEBUG] State: %v, Buttons: %v\\n", g.gameState, tempButtonTexts)
+	// fmt.Printf("[DRAW DEBUG] State: %v, Buttons: %v\n", g.gameState, tempButtonTexts)
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -455,7 +459,12 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	case StatePlacingRiverSource:
 		drawGrid = g.roadLayoutGrid
 	case StateCalculating:
-		drawGrid = g.overallBestSolutionInIterativeRun.Grid
+		// Draw the current absolute best solution if valid, otherwise the road layout
+		if g.absoluteBestOverallSolution.Profit >= 0 && g.absoluteBestOverallSolution.Path != nil { // Path is a better indicator than Grid != nil for array types
+			drawGrid = g.absoluteBestOverallSolution.Grid
+		} else {
+			drawGrid = g.roadLayoutGrid // Fallback to road layout if no solution yet
+		}
 	case StateShowingResult:
 		drawGrid = g.finalBestSolution.Grid
 	default:
@@ -505,31 +514,14 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	}
 
 	// Draw the current path from overallBestSolutionInIterativeRun if calculating iteratively
-	if g.gameState == StateCalculating && g.isIterativeCalculationActive && len(g.overallBestSolutionInIterativeRun.Path) > 0 {
+	// This section needs to be updated to use g.absoluteBestOverallSolution
+	if g.gameState == StateCalculating && g.absoluteBestOverallSolution.Profit >= 0 && len(g.absoluteBestOverallSolution.Path) > 0 {
 		pathColor := color.RGBA{R: 255, G: 105, B: 180, A: 200} // Hot pink
-		if len(g.overallBestSolutionInIterativeRun.Path) > 0 {  // Redundant check, but safe
-			firstTile := g.overallBestSolutionInIterativeRun.Path[0]
-			ebitenutil.DrawRect(gameSubImage, float64(firstTile.X*tileSize), float64(firstTile.Y*tileSize), float64(tileSize-1), float64(tileSize-1), color.RGBA{R: 255, G: 0, B: 0, A: 100}) // Semi-transparent red overlay on start
-		}
-		for i := 0; i < len(g.overallBestSolutionInIterativeRun.Path)-1; i++ {
-			p1 := g.overallBestSolutionInIterativeRun.Path[i]
-			p2 := g.overallBestSolutionInIterativeRun.Path[i+1]
-			x1 := float64(p1.X*tileSize) + float64(tileSize)/2
-			y1 := float64(p1.Y*tileSize) + float64(tileSize)/2
-			x2 := float64(p2.X*tileSize) + float64(tileSize)/2
-			y2 := float64(p2.Y*tileSize) + float64(tileSize)/2
-			ebitenutil.DrawLine(gameSubImage, x1, y1, x2, y2, pathColor)
-		}
-	} else if g.gameState == StateCalculating && !g.isIterativeCalculationActive && len(g.intermediateBestSolution.Path) > 0 {
-		// Fallback for non-iterative calculation (if that path is ever re-enabled) or if isIterativeCalculationActive is somehow false
-		pathColor := color.RGBA{R: 255, G: 105, B: 180, A: 200} // Hot pink
-		if len(g.intermediateBestSolution.Path) > 0 {
-			firstTile := g.intermediateBestSolution.Path[0]
-			ebitenutil.DrawRect(gameSubImage, float64(firstTile.X*tileSize), float64(firstTile.Y*tileSize), float64(tileSize-1), float64(tileSize-1), color.RGBA{R: 255, G: 0, B: 0, A: 100})
-		}
-		for i := 0; i < len(g.intermediateBestSolution.Path)-1; i++ {
-			p1 := g.intermediateBestSolution.Path[i]
-			p2 := g.intermediateBestSolution.Path[i+1]
+		firstTile := g.absoluteBestOverallSolution.Path[0]
+		ebitenutil.DrawRect(gameSubImage, float64(firstTile.X*tileSize), float64(firstTile.Y*tileSize), float64(tileSize-1), float64(tileSize-1), color.RGBA{R: 255, G: 0, B: 0, A: 100}) // Semi-transparent red overlay on start
+		for i := 0; i < len(g.absoluteBestOverallSolution.Path)-1; i++ {
+			p1 := g.absoluteBestOverallSolution.Path[i]
+			p2 := g.absoluteBestOverallSolution.Path[i+1]
 			x1 := float64(p1.X*tileSize) + float64(tileSize)/2
 			y1 := float64(p1.Y*tileSize) + float64(tileSize)/2
 			x2 := float64(p2.X*tileSize) + float64(tileSize)/2
@@ -551,6 +543,108 @@ func (g *Game) Draw(screen *ebiten.Image) {
 // If you don't have to adjust the screen size with the outside size, just return a fixed size.
 func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
 	return screenWidth, screenHeight
+}
+
+// This is the new worker goroutine function.
+// It calculates paths for a single starting tile across various lengths.
+func (g *Game) runPathCalculationWorker(
+	startNode game.Coordinate,
+	userSelectedMaxLength int,
+	stopChan chan struct{}, // Shared stop channel for all workers of a calculation batch
+	disableCrossAdjacencyForCalc bool,
+	roadLayoutAtCalcStart game.Grid, // Pass a copy of the roadLayoutGrid at the time of calculation start
+	workerCalcID int, // The calculation ID this worker belongs to
+) {
+	defer g.activeCalculationGoroutines.Done() // Signal that this worker has finished
+
+	fmt.Printf("[Worker %v, CalcID %d] Started. MaxLen: %d\n", startNode, workerCalcID, userSelectedMaxLength)
+
+	// Each worker has its own best solution found for its startNode. Grid is copied by value automatically.
+	workerOverallBestSolution := game.RiverPathSolution{Grid: roadLayoutAtCalcStart, Profit: -1.0, Path: nil}
+
+	for lengthToTest := minRiverLength; lengthToTest <= userSelectedMaxLength; lengthToTest++ {
+		// --- Check for stop signal or outdated calculation before starting a length test ---
+		select {
+		case <-stopChan:
+			fmt.Printf("[Worker %v, CalcID %d] Stop signal received before testing length %d. Exiting.\n", startNode, workerCalcID, lengthToTest)
+			return // Exit worker if global stop is signaled
+		default:
+			// Non-blocking check if this worker's calculation ID is still current
+			g.mu.Lock()
+			if workerCalcID != g.currentCalculationID {
+				g.mu.Unlock()
+				fmt.Printf("[Worker %v, CalcID %d] Outdated (current global CalcID is %d). Exiting before length %d.\n", startNode, workerCalcID, g.currentCalculationID, lengthToTest)
+				return // Exit if this worker is for an old calculation batch
+			}
+			// Optional: Update some per-worker progress indicator if we had one
+			// fmt.Printf("[Worker %v, CalcID %d] Testing length %d...\n", startNode, workerCalcID, lengthToTest)
+			g.mu.Unlock()
+		}
+
+		// This will store the best solution found for the current startNode and current lengthToTest. Grid is copied by value.
+		currentLengthBestSolution := game.RiverPathSolution{Grid: roadLayoutAtCalcStart, Profit: -1.0, Path: nil}
+
+		// Progress callback for FindOptimalRiverAndForests for this specific length test
+		lengthProgressCb := func(intermediateSolutionForThisLengthTest game.RiverPathSolution) {
+			// This callback is for the current startNode and lengthToTest
+			// It finds the best solution *for this specific lengthToTest*
+			if intermediateSolutionForThisLengthTest.Profit > currentLengthBestSolution.Profit {
+				currentLengthBestSolution = intermediateSolutionForThisLengthTest
+			}
+		}
+
+		// FindOptimalRiverAndForests expects to operate on a grid.
+		// It modifies the grid it's called on. So, give it a fresh copy of the road layout for each length.
+		// Since game.Grid is an array type, assignment creates a copy.
+		gridForThisLengthTest := roadLayoutAtCalcStart
+		_, errThisLength := gridForThisLengthTest.FindOptimalRiverAndForests(startNode, lengthToTest, lengthProgressCb, stopChan, disableCrossAdjacencyForCalc)
+
+		// --- After a length is fully tested (or stopped partway for this length) ---
+		g.mu.Lock()
+		// Double-check if this worker is still for the current calculation before updating global state
+		if workerCalcID != g.currentCalculationID {
+			g.mu.Unlock()
+			fmt.Printf("[Worker %v, CalcID %d] Outdated (current global CalcID is %d) after testing length %d. Discarding result.\n", startNode, workerCalcID, g.currentCalculationID, lengthToTest)
+			return // Exit if outdated
+		}
+
+		if errThisLength == nil { // Completed this length test successfully
+			if currentLengthBestSolution.Profit > workerOverallBestSolution.Profit {
+				workerOverallBestSolution = currentLengthBestSolution
+				// The grid in workerOverallBestSolution is the one modified by FindOptimalRiverAndForests
+			}
+		} else if errThisLength.Error() == "search stopped by user" {
+			// If search for this length was stopped, currentLengthBestSolution might hold a partial (but valid) result.
+			if currentLengthBestSolution.Profit > workerOverallBestSolution.Profit {
+				workerOverallBestSolution = currentLengthBestSolution
+			}
+			// This worker will now update global best (if applicable) and then exit due to the stop signal.
+		} else {
+			fmt.Printf("[Worker %v, CalcID %d] Error testing length %d: %v\n", startNode, workerCalcID, lengthToTest, errThisLength)
+		}
+
+		// Compare this worker's best solution found so far (workerOverallBestSolution)
+		// with the global absolute best solution.
+		if workerOverallBestSolution.Profit > g.absoluteBestOverallSolution.Profit {
+			fmt.Printf("[Worker %v, CalcID %d] New global best found! Profit: %.2f%% (was %.2f%%). Path len: %d, At length test: %d\n",
+				startNode, workerCalcID, workerOverallBestSolution.Profit*100, g.absoluteBestOverallSolution.Profit*100, len(workerOverallBestSolution.Path), lengthToTest)
+			g.absoluteBestOverallSolution = workerOverallBestSolution // This worker's best is now the global best
+			// Update the main game grid for live display if the solution is valid
+			if g.absoluteBestOverallSolution.Profit >= 0 && len(g.absoluteBestOverallSolution.Path) > 0 { // Path is sufficient to check validity
+				g.grid = g.absoluteBestOverallSolution.Grid // Show the new best grid
+			}
+		}
+		g.updateCalculationStatus() // Update the status text on the UI panel
+		g.mu.Unlock()
+
+		// If an error occurred that indicates a stop (like "search stopped by user"), exit the worker's loop.
+		if errThisLength != nil && errThisLength.Error() == "search stopped by user" {
+			fmt.Printf("[Worker %v, CalcID %d] Confirming exit due to stop signal after processing length %d.\n", startNode, workerCalcID, lengthToTest)
+			return
+		}
+	} // End of loop for lengthToTest
+
+	fmt.Printf("[Worker %v, CalcID %d] Finished all lengths.\n", startNode, workerCalcID)
 }
 
 func (g *Game) updateButtonsForState() {
@@ -595,10 +689,13 @@ func (g *Game) updateButtonsForState() {
 				g.roadLayoutGrid = g.grid
 				g.gameState = StatePlacingRiverSource
 				g.validRiverStarts = g.roadLayoutGrid.GetValidRiverStarts()
-				fmt.Printf("[DEBUG] Finalized Road. Number of valid river starts: %d. Starts: %v\\n", len(g.validRiverStarts), g.validRiverStarts)
-				g.intermediateBestSolution.Grid = g.roadLayoutGrid
-				g.intermediateBestSolution.Path = nil
-				g.finalBestSolution = g.intermediateBestSolution
+				fmt.Printf("[DEBUG] Finalized Road. Number of valid river starts: %d. Starts: %v\n", len(g.validRiverStarts), g.validRiverStarts)
+				// g.intermediateBestSolution.Grid = g.roadLayoutGrid // REMOVED
+				// g.intermediateBestSolution.Path = nil // REMOVED
+				// g.finalBestSolution = g.intermediateBestSolution // REMOVED
+				// Instead, reset relevant solution holders
+				g.finalBestSolution = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
+				g.absoluteBestOverallSolution = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
 				g.selectedRiverStart = game.Coordinate{}
 				fmt.Println("Road placement finalized. Stored roadLayoutGrid. Ready to select river source.")
 				g.updateCalculationStatus()
@@ -620,148 +717,207 @@ func (g *Game) updateButtonsForState() {
 			},
 		})
 
+		// Button for calculating only the selected start
+		selectedStartButtonText := "Calculate Selected Start (Pick One)"
 		isValidSrcSelected := false
-		if !(g.selectedRiverStart.X == 0 && g.selectedRiverStart.Y == 0) {
+		if !(g.selectedRiverStart.X == 0 && g.selectedRiverStart.Y == 0) { // Check if a start is selected (0,0 is invalid default)
 			for _, vs := range g.validRiverStarts {
 				if vs.X == g.selectedRiverStart.X && vs.Y == g.selectedRiverStart.Y {
 					isValidSrcSelected = true
+					selectedStartButtonText = fmt.Sprintf("Calculate Selected Start (%d,%d)", g.selectedRiverStart.X, g.selectedRiverStart.Y)
 					break
 				}
 			}
 		}
-		startCalcButtonText := "Start Calculation"
-		if !isValidSrcSelected {
-			startCalcButtonText = "Start Calculation (Pick Source First)"
-		}
+		g.buttons = append(g.buttons, Button{
+			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
+			Text: selectedStartButtonText,
+			OnClick: func(g *Game) {
+				if !isValidSrcSelected {
+					fmt.Println("[DEBUG] 'Calculate Selected Start' clicked, but no valid source selected.")
+					return // Do nothing if no valid source is selected
+				}
+				fmt.Printf("[DEBUG] Calculate Selected Start button clicked for (%d,%d).\n", g.selectedRiverStart.X, g.selectedRiverStart.Y)
+				g.gameState = StateCalculating
+				g.updateButtonsForState()
+				g.calculationStartTime = time.Now()
+				g.absoluteBestOverallSolution = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
+				g.stopCalcChannel = make(chan struct{})
+				g.lengthUsedForCurrentCalculation = g.currentMaxRiverLength
+				g.calculationID++
+				g.currentCalculationID = g.calculationID
+				// For single start calculation, validRiverStarts will contain only the selected one
+				startsForThisCalc := []game.Coordinate{g.selectedRiverStart}
+				g.numWorkersForCurrentCalc = 1 // Single worker
+
+				fmt.Printf("[DEBUG] Launching Single Start Calculation. MaxLen: %d, DisableCrossAdj: %t, Start: (%d,%d), CalcID: %d\n",
+					g.lengthUsedForCurrentCalculation, g.DisableCrossRiverAdjacency, g.selectedRiverStart.X, g.selectedRiverStart.Y, g.currentCalculationID)
+
+				go func(masterCalcID int, masterStopChan chan struct{}, maxLength int, disableAdj bool, roadLayout game.Grid, specificStarts []game.Coordinate) {
+					defer func() {
+						g.mu.Lock()
+						defer g.mu.Unlock()
+						if masterCalcID != g.currentCalculationID {
+							fmt.Printf("[DEBUG] Master goroutine for outdated SINGLE START calcID %d (current %d) finished. No state change.\n", masterCalcID, g.currentCalculationID)
+							return
+						}
+						fmt.Printf("[DEBUG] Master goroutine (SINGLE START calcID %d) finished.\n", masterCalcID)
+						g.gameState = StateShowingResult
+						g.finalBestSolution = g.absoluteBestOverallSolution
+						if g.finalBestSolution.Path == nil {
+							g.finalBestSolution.Grid = roadLayout
+							g.finalBestSolution.Profit = -1.0
+						}
+						if g.finalBestSolution.Path != nil {
+							g.maxLenUsedForFinalSolution = len(g.finalBestSolution.Path)
+						} else {
+							g.maxLenUsedForFinalSolution = 0
+						}
+						if g.finalBestSolution.Path != nil {
+							g.grid = g.finalBestSolution.Grid
+						} else {
+							g.grid = roadLayout
+						}
+						if masterStopChan != nil {
+							select {
+							case <-masterStopChan:
+							default:
+								close(masterStopChan)
+							}
+							if g.stopCalcChannel == masterStopChan {
+								g.stopCalcChannel = nil
+							}
+						}
+						g.updateButtonsForState()
+						g.updateCalculationStatus()
+						fmt.Printf("[DEBUG] Single Start Calc: Transitioned to StateShowingResult. Final best profit: %.2f%%\n", g.finalBestSolution.Profit*100)
+					}()
+
+					if len(specificStarts) == 0 { // Should not happen if button logic is correct
+						fmt.Println("[DEBUG] No start specified for single start calculation. Aborting.")
+						return
+					}
+					// Only one worker for the specific start
+					g.activeCalculationGoroutines.Add(1)
+					fmt.Printf("[DEBUG] Master goroutine (SINGLE START calcID %d): Launching worker for start %v\n", masterCalcID, specificStarts[0])
+					go g.runPathCalculationWorker(specificStarts[0], maxLength, masterStopChan, disableAdj, roadLayout, masterCalcID)
+
+					g.activeCalculationGoroutines.Wait() // Wait for the single worker
+					fmt.Printf("[DEBUG] Master goroutine (SINGLE START calcID %d): Wait finished.\n", masterCalcID)
+				}(g.currentCalculationID, g.stopCalcChannel, g.lengthUsedForCurrentCalculation, g.DisableCrossRiverAdjacency, g.roadLayoutGrid, startsForThisCalc)
+			},
+		})
+
+		startCalcButtonText := "Calculate All Valid Starts" // Renamed button
+		// isValidSrcSelected := false // No longer needed as we iterate all valid starts // REMOVED
+		// if !(g.selectedRiverStart.X == 0 && g.selectedRiverStart.Y == 0) { // REMOVED
+		// 	for _, vs := range g.validRiverStarts {
+		// 		if vs.X == g.selectedRiverStart.X && vs.Y == g.selectedRiverStart.Y {
+		// 			isValidSrcSelected = true
+		// 			break
+		// 		}
+		// 	}
+		// }
+		// if !isValidSrcSelected {
+		// 	startCalcButtonText = "Start Calculation (Pick Source First)" // Obsolete message
+		// }
 		g.buttons = append(g.buttons, Button{
 			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
 			Text: startCalcButtonText,
 			OnClick: func(g *Game) {
-				fmt.Printf("[DEBUG] Start Calculation button clicked. Valid source selected: (%d, %d)\\n", g.selectedRiverStart.X, g.selectedRiverStart.Y)
+				fmt.Printf("[DEBUG] Start Global Calculation button clicked.\n")
 				g.gameState = StateCalculating
 				g.updateButtonsForState() // Ensure Stop button appears immediately
 				g.calculationStartTime = time.Now()
 
 				// Initialize for iterative calculation
-				g.isIterativeCalculationActive = true
-				g.overallBestSolutionInIterativeRun = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
-				g.intermediateBestSolution = g.overallBestSolutionInIterativeRun // Start with overall best as intermediate
+				// g.isIterativeCalculationActive = true // REMOVED
+				// g.overallBestSolutionInIterativeRun = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil} // REMOVED
+				// g.intermediateBestSolution = g.overallBestSolutionInIterativeRun // REMOVED
+				// Grid is an array type, so assignment copies. Initialize with the current road layout.
+				g.absoluteBestOverallSolution = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
 
 				g.stopCalcChannel = make(chan struct{}) // Make sure this is fresh for each new calculation cycle
-				fmt.Printf("[DEBUG] Set to StateCalculating. Target MaxLen %d. stopCalcChannel created: %p\n", g.currentMaxRiverLength, g.stopCalcChannel)
+				// fmt.Printf("[DEBUG] Set to StateCalculating. Target MaxLen %d. stopCalcChannel created: %p\n", g.currentMaxRiverLength, g.stopCalcChannel) // Old log
 
-				gridForCalculation := g.roadLayoutGrid
-				startNode := g.selectedRiverStart
-				stopChan := g.stopCalcChannel // Capture for goroutine
-				userSelectedMaxLength := g.currentMaxRiverLength
-				disableCrossAdjacencyForCalc := g.DisableCrossRiverAdjacency
+				// gridForCalculation := g.roadLayoutGrid // This will be handled by workers with copies // REMOVED
+				// startNode := g.selectedRiverStart // No longer a single start node here // REMOVED
+				// stopChan := g.stopCalcChannel // Will be passed to master goroutine // REMOVED
+				// userSelectedMaxLength := g.currentMaxRiverLength // Will be passed // REMOVED
+				// disableCrossAdjacencyForCalc := g.DisableCrossRiverAdjacency // Will be passed // REMOVED
 
-				g.lengthUsedForCurrentCalculation = userSelectedMaxLength // Store the user's target max length
+				g.lengthUsedForCurrentCalculation = g.currentMaxRiverLength // Store the user's target max length
+				g.calculationID++
+				g.currentCalculationID = g.calculationID
+				allValidStarts := g.roadLayoutGrid.GetValidRiverStarts() // Ensure it's fresh
+				g.numWorkersForCurrentCalc = len(allValidStarts)         // Set number of workers
 
-				fmt.Printf("[DEBUG] Launching iterative calculation goroutine. Target MaxLen: %d, stopChan: %p, DisableCrossAdj: %t\n", userSelectedMaxLength, stopChan, disableCrossAdjacencyForCalc)
+				fmt.Printf("[DEBUG] Launching Global Calculation. MaxLen: %d, StopChan: %p, DisableCrossAdj: %t, NumStarts: %d, CalcID: %d\n",
+					g.lengthUsedForCurrentCalculation, g.stopCalcChannel, g.DisableCrossRiverAdjacency, g.numWorkersForCurrentCalc, g.currentCalculationID)
 
-				go func() {
-					fmt.Printf("[DEBUG] Iterative Goroutine started. Target MaxLen: %d, stopChan: %p\n", userSelectedMaxLength, stopChan)
-
-					progressCb := func(intermediateSolutionForCurrentLength game.RiverPathSolution) {
+				// --- Launch Master Goroutine ---
+				go func(masterCalcID int, masterStopChan chan struct{}, maxLength int, disableAdj bool, roadLayout game.Grid, initialStarts []game.Coordinate) {
+					defer func() {
 						g.mu.Lock()
-						// Update intermediate best for the *current length* being tested
-						if intermediateSolutionForCurrentLength.Profit > g.intermediateBestSolution.Profit || g.intermediateBestSolution.Path == nil {
-							g.intermediateBestSolution = intermediateSolutionForCurrentLength
+						defer g.mu.Unlock()
+						if masterCalcID != g.currentCalculationID {
+							fmt.Printf("[DEBUG] Master goroutine for outdated RECALC ID %d (current %d) finished. No state change.\n", masterCalcID, g.currentCalculationID)
+							return
 						}
-
-						// If this intermediate result is also better than the *overall best* found so far in this iterative run, update overall best
-						if intermediateSolutionForCurrentLength.Profit > g.overallBestSolutionInIterativeRun.Profit {
-							g.overallBestSolutionInIterativeRun = intermediateSolutionForCurrentLength
+						fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d) finished.\n", masterCalcID)
+						g.gameState = StateShowingResult
+						g.finalBestSolution = g.absoluteBestOverallSolution
+						if g.finalBestSolution.Path == nil { // If no path, reset to road layout
+							g.finalBestSolution.Grid = roadLayout // Assignment copies array
+							// Path already nil
+							g.finalBestSolution.Profit = -1.0
 						}
-
+						if g.finalBestSolution.Path != nil {
+							g.maxLenUsedForFinalSolution = len(g.finalBestSolution.Path)
+						} else {
+							g.maxLenUsedForFinalSolution = 0
+						}
+						if g.finalBestSolution.Path != nil {
+							g.grid = g.finalBestSolution.Grid
+						} else {
+							g.grid = roadLayout // Assignment copies array
+						}
+						if masterStopChan != nil {
+							select {
+							case <-masterStopChan:
+							default:
+								close(masterStopChan)
+							}
+							if g.stopCalcChannel == masterStopChan {
+								g.stopCalcChannel = nil
+							}
+						}
+						g.updateButtonsForState()
 						g.updateCalculationStatus()
-						g.mu.Unlock()
+						fmt.Printf("[DEBUG] Recalculation: Transitioned to StateShowingResult. Final best profit: %.2f%%\n", g.finalBestSolution.Profit*100)
+					}()
+
+					if len(initialStarts) == 0 {
+						fmt.Println("[DEBUG] No valid river starts for recalculation.")
+						return
 					}
-
-					// No local iterativeOverallBest needed; g.overallBestSolutionInIterativeRun is the source of truth
-
-					for lengthToTest := minRiverLength; lengthToTest <= userSelectedMaxLength; lengthToTest++ {
+					for _, startNode := range initialStarts {
 						select {
-						case <-stopChan:
-							fmt.Println("[DEBUG] Iterative calc loop: stopChan closed before testing length", lengthToTest)
-							goto endOfCalculation // Use goto to break out of nested loops and proceed to cleanup
+						case <-masterStopChan:
+							fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d): stop signal before worker for %v.\n", masterCalcID, startNode)
+							g.activeCalculationGoroutines.Wait()
+							return
 						default:
 						}
-
-						g.mu.Lock()
-						g.currentLengthBeingTested = lengthToTest
-						// Reset intermediate best for this specific length test
-						g.intermediateBestSolution = game.RiverPathSolution{Grid: gridForCalculation, Profit: -1.0, Path: nil}
-						g.updateCalculationStatus() // Update status to show "Testing Len X..."
-						g.mu.Unlock()
-
-						fmt.Printf("[DEBUG] Iterative Goroutine: Testing length %d\n", lengthToTest)
-						localGridCopy := gridForCalculation
-						_, errThisLength := localGridCopy.FindOptimalRiverAndForests(startNode, lengthToTest, progressCb, stopChan, disableCrossAdjacencyForCalc)
-
-						// After a length is fully tested (or stopped partway for this length)
-						g.mu.Lock()
-						if errThisLength == nil {
-							// progressCb has already updated g.intermediateBestSolution with the best for this length,
-							// and g.overallBestSolutionInIterativeRun if it was a new global best.
-							// No specific action needed here for solutionForThisLength itself.
-						} else if errThisLength.Error() == "search stopped by user" {
-							// If search for this length was stopped, g.intermediateBestSolution holds the best for the partial run.
-							// progressCb would have updated g.overallBestSolutionInIterativeRun if that partial result was a new global best.
-							g.mu.Unlock()
-							goto endOfCalculation // User stopped, break outer loop
-						} else {
-							fmt.Printf("[DEBUG] Error testing length %d: %v\n", lengthToTest, errThisLength)
-						}
-						g.updateCalculationStatus() // Update with potentially new overall best
-						g.mu.Unlock()
+						g.activeCalculationGoroutines.Add(1)
+						fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d): Launching worker for start %v\n", masterCalcID, startNode)
+						// Pass roadLayout by value (it's an array, so it gets copied)
+						go g.runPathCalculationWorker(startNode, maxLength, masterStopChan, disableAdj, roadLayout, masterCalcID)
 					}
-
-					// Label for goto to jump to the end of calculation processing
-				endOfCalculation:
-					g.mu.Lock()
-					userForcedStop := false
-					select {
-					case <-stopChan: // Check if stopChan was closed
-						userForcedStop = true
-					default:
-					}
-
-					g.isIterativeCalculationActive = false // Iteration finished or stopped
-					if g.stopCalcChannel == stopChan || (userForcedStop && g.stopCalcChannel == stopChan) {
-						g.gameState = StateShowingResult
-						if userForcedStop {
-							fmt.Println("Iterative calculation stopped by user. Showing best overall result found.")
-						} else { // Successful completion of all iterations
-							fmt.Printf("Iterative Goroutine: All lengths tested. Overall Best Profit: %.2f%%. Path Len: %d\n", g.overallBestSolutionInIterativeRun.Profit*100, len(g.overallBestSolutionInIterativeRun.Path))
-						}
-						// g.overallBestSolutionInIterativeRun now holds the true overall best.
-						g.finalBestSolution = g.overallBestSolutionInIterativeRun
-						if g.finalBestSolution.Profit < 0 { // If nothing was ever found
-							g.finalBestSolution.Grid = g.roadLayoutGrid
-							g.finalBestSolution.Path = nil
-						}
-						g.maxLenUsedForFinalSolution = len(g.finalBestSolution.Path)
-						if !userForcedStop { // Only update main display grid on natural completion
-							g.grid = g.finalBestSolution.Grid
-						}
-						// Align intermediate with final for display in ShowingResult state
-						g.intermediateBestSolution = g.finalBestSolution
-
-						if g.stopCalcChannel == stopChan && !userForcedStop { // If calc completed naturally
-							close(g.stopCalcChannel)
-						}
-						g.stopCalcChannel = nil // Clear the channel reference
-					} else {
-						fmt.Println("Goroutine for an older calculation finished or channel mismatch. No update to game state.")
-					}
-
-					g.updateButtonsForState()
-					g.updateCalculationStatus()
-					g.mu.Unlock()
-				}()
-
+					fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d): All %d workers launched. Waiting...\n", masterCalcID, len(initialStarts))
+					g.activeCalculationGoroutines.Wait()
+					fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d): Wait finished.\n", masterCalcID)
+				}(g.currentCalculationID, g.stopCalcChannel, g.lengthUsedForCurrentCalculation, g.DisableCrossRiverAdjacency, g.roadLayoutGrid, g.validRiverStarts) // Pass roadLayoutGrid by value
 			},
 		})
 		g.buttons = append(g.buttons, Button{
@@ -773,7 +929,8 @@ func (g *Game) updateButtonsForState() {
 				g.finalBestSolution.Grid = g.grid // Reset solutions
 				g.finalBestSolution.Path = nil
 				g.finalBestSolution.Profit = -1.0
-				g.intermediateBestSolution = g.finalBestSolution
+				// g.intermediateBestSolution = g.finalBestSolution // REMOVED
+				g.absoluteBestOverallSolution = g.finalBestSolution // Also reset this one
 				g.maxLenUsedForFinalSolution = 0
 				g.validRiverStarts = nil
 				g.selectedRiverStart = game.Coordinate{}
@@ -786,167 +943,123 @@ func (g *Game) updateButtonsForState() {
 	case StateCalculating:
 		g.buttons = append(g.buttons, Button{
 			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
-			Text: "Stop Calculation",
+			Text: "Stop All Calculations",                  // Changed text
 			OnClick: func(g *Game) {
-				fmt.Printf("[SIMPLIFIED DEBUG] Stop Calculation button clicked. Current state: %v, g.stopCalcChannel: %p\\n", g.gameState, g.stopCalcChannel)
+				fmt.Printf("[SIMPLIFIED DEBUG] Stop Calculation button clicked. Current state: %v, g.stopCalcChannel: %p\n", g.gameState, g.stopCalcChannel)
 				if g.gameState == StateCalculating {
 					if g.stopCalcChannel != nil {
-						fmt.Println("[SIMPLIFIED DEBUG] Closing stopCalcChannel.")
-						close(g.stopCalcChannel)
-						// The goroutine is expected to see this, change state to ShowingResult,
-						// and then that goroutine will call updateButtonsForState() and updateCalculationStatus().
-						g.calculationStatus = "Stopping..."
+						fmt.Println("[SIMPLIFIED DEBUG] Closing stopCalcChannel to stop all workers.")
+						// Check if channel is already closed to prevent panic
+						select {
+						case <-g.stopCalcChannel:
+							// Already closed
+							fmt.Println("[SIMPLIFIED DEBUG] stopCalcChannel was already closed.")
+						default:
+							close(g.stopCalcChannel)
+						}
+						// The master goroutine's defer will handle state transition and nulling g.stopCalcChannel if it's the active one.
+						g.calculationStatus = "Stopping all calculations..."
+						// Do NOT change gameState here. Let the master goroutine do it.
 					} else {
-						fmt.Println("[SIMPLIFIED DEBUG] stopCalcChannel is nil, but was in StateCalculating. Forcing to ShowingResult.")
-						// This case may occur if the goroutine finished and nulled the channel just before stop was clicked.
+						fmt.Println("[SIMPLIFIED DEBUG] stopCalcChannel is nil, but was in StateCalculating. Forcing to ShowingResult (fallback).")
+						// This is a fallback, ideally master goroutine handles it.
 						g.gameState = StateShowingResult
-						g.finalBestSolution.Grid = g.roadLayoutGrid // Default to road layout
+						g.finalBestSolution.Grid = g.roadLayoutGrid // Assignment copies array
 						g.finalBestSolution.Path = nil
 						g.finalBestSolution.Profit = -1.0
+						g.absoluteBestOverallSolution = g.finalBestSolution
 						g.updateButtonsForState()
 						g.updateCalculationStatus()
 					}
-				} // Closes if g.gameState == StateCalculating
+				}
 			},
 		})
 
 	case StateShowingResult:
 		g.buttons = append(g.buttons, Button{
 			Rect: image.Rect(buttonMinX, 0, buttonMaxX, 0), // Y will be set in Draw
-			Text: "Recalculate (New Max Len)",
+			Text: "Recalculate All (New Max Len)",          // Changed text
 			OnClick: func(g *Game) {
-				// Ensure selectedRiverStart is valid (it should be from the previous solution)
-				if (g.selectedRiverStart.X == 0 && g.selectedRiverStart.Y == 0) && len(g.finalBestSolution.Path) > 0 {
-					g.selectedRiverStart = g.finalBestSolution.Path[0] // Recover if somehow lost
-				}
+				// This will now trigger a new global calculation, similar to "Start Global Calculation"
+				fmt.Printf("Recalculating All with MaxLen: %d\n", g.currentMaxRiverLength)
+				g.gameState = StateCalculating
+				g.updateButtonsForState()
+				g.calculationStartTime = time.Now()
 
-				isValidSourceForRecalc := false
-				tempValidStarts := g.roadLayoutGrid.GetValidRiverStarts() // Recalculate based on original road layout
-				for _, vs := range tempValidStarts {
-					if vs.X == g.selectedRiverStart.X && vs.Y == g.selectedRiverStart.Y {
-						isValidSourceForRecalc = true
-						break
-					}
-				}
+				// Grid is an array type, assignment copies.
+				g.absoluteBestOverallSolution = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
+				g.stopCalcChannel = make(chan struct{})
+				g.lengthUsedForCurrentCalculation = g.currentMaxRiverLength
+				g.calculationID++
+				g.currentCalculationID = g.calculationID
+				g.validRiverStarts = g.roadLayoutGrid.GetValidRiverStarts() // Refresh valid starts
 
-				if isValidSourceForRecalc {
-					fmt.Printf("Recalculating with MaxLen: %d for start (%d, %d)\\n", g.currentMaxRiverLength, g.selectedRiverStart.X, g.selectedRiverStart.Y)
-					g.gameState = StateCalculating
-					g.updateButtonsForState() // Ensure Stop button appears immediately
-					g.calculationStartTime = time.Now()
+				fmt.Printf("[DEBUG] Launching Global Recalculation. MaxLen: %d, StopChan: %p, DisableCrossAdj: %t, NumStarts: %d, CalcID: %d\n",
+					g.lengthUsedForCurrentCalculation, g.stopCalcChannel, g.DisableCrossRiverAdjacency, len(g.validRiverStarts), g.currentCalculationID)
 
-					// Initialize for iterative re-calculation
-					g.isIterativeCalculationActive = true
-					g.overallBestSolutionInIterativeRun = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
-					g.intermediateBestSolution = g.overallBestSolutionInIterativeRun
-
-					g.stopCalcChannel = make(chan struct{})
-
-					gridForCalc := g.roadLayoutGrid
-					startNode := g.selectedRiverStart
-					stopChan := g.stopCalcChannel
-					userSelectedMaxLenForRecalc := g.currentMaxRiverLength
-					disableCrossAdjacencyForRecalc := g.DisableCrossRiverAdjacency
-
-					g.lengthUsedForCurrentCalculation = userSelectedMaxLenForRecalc // Store the user's target max length
-
-					fmt.Printf("[DEBUG] Launching iterative re-calculation goroutine. Target MaxLen: %d, stopChan: %p, DisableCrossAdj: %t\n", userSelectedMaxLenForRecalc, stopChan, disableCrossAdjacencyForRecalc)
-					go func() {
-						fmt.Printf("[DEBUG] Iterative Re-calc Goroutine started. Target MaxLen: %d, stopChan: %p\n", userSelectedMaxLenForRecalc, stopChan)
-
-						progressCb := func(intermediateSolutionForCurrentLength game.RiverPathSolution) {
-							g.mu.Lock()
-							// Update intermediate best for the *current length* being tested
-							if intermediateSolutionForCurrentLength.Profit > g.intermediateBestSolution.Profit || g.intermediateBestSolution.Path == nil {
-								g.intermediateBestSolution = intermediateSolutionForCurrentLength
-							}
-							// If this intermediate result is also better than the *overall best* found so far in this iterative run, update overall best
-							if intermediateSolutionForCurrentLength.Profit > g.overallBestSolutionInIterativeRun.Profit {
-								g.overallBestSolutionInIterativeRun = intermediateSolutionForCurrentLength
-							}
-							g.updateCalculationStatus()
-							g.mu.Unlock()
-						}
-						// No local iterativeOverallBest needed
-
-						for lengthToTest := minRiverLength; lengthToTest <= userSelectedMaxLenForRecalc; lengthToTest++ {
-							select {
-							case <-stopChan:
-								fmt.Println("[DEBUG] Iterative re-calc loop: stopChan closed before testing length", lengthToTest)
-								goto endOfRecalculation
-							default:
-							}
-
-							g.mu.Lock()
-							g.currentLengthBeingTested = lengthToTest
-							g.intermediateBestSolution = game.RiverPathSolution{Grid: gridForCalc, Profit: -1.0, Path: nil} // Reset for current length
-							g.updateCalculationStatus()
-							g.mu.Unlock()
-
-							fmt.Printf("[DEBUG] Iterative Re-calc Goroutine: Testing length %d\n", lengthToTest)
-							localGridCopy := gridForCalc
-							_, errThisLength := localGridCopy.FindOptimalRiverAndForests(startNode, lengthToTest, progressCb, stopChan, disableCrossAdjacencyForRecalc)
-
-							g.mu.Lock()
-							if errThisLength == nil {
-								// progressCb has already updated g.intermediateBestSolution with the best for this length,
-								// and g.overallBestSolutionInIterativeRun if it was a new global best.
-							} else if errThisLength.Error() == "search stopped by user" {
-								// progressCb would have updated g.overallBestSolutionInIterativeRun if the partial result was a new global best.
-								g.mu.Unlock()
-								goto endOfRecalculation
-							} else {
-								fmt.Printf("[DEBUG] Error during re-calc testing length %d: %v\n", lengthToTest, errThisLength)
-							}
-							g.updateCalculationStatus()
-							g.mu.Unlock()
-						}
-
-					endOfRecalculation:
+				// --- Launch Master Goroutine (copied from Start Global Calculation) ---
+				go func(masterCalcID int, masterStopChan chan struct{}, maxLength int, disableAdj bool, roadLayout game.Grid, initialStarts []game.Coordinate) {
+					defer func() {
 						g.mu.Lock()
-						userForcedStop := false
-						select {
-						case <-stopChan:
-							userForcedStop = true
-						default:
+						defer g.mu.Unlock()
+						if masterCalcID != g.currentCalculationID {
+							fmt.Printf("[DEBUG] Master goroutine for outdated RECALC ID %d (current %d) finished. No state change.\n", masterCalcID, g.currentCalculationID)
+							return
 						}
-
-						g.isIterativeCalculationActive = false
-						if g.stopCalcChannel == stopChan || (userForcedStop && g.stopCalcChannel == stopChan) {
-							g.gameState = StateShowingResult
-							if userForcedStop {
-								fmt.Println("Iterative re-calculation stopped. Showing best overall result found.")
-							} else { // Successful completion
-								fmt.Printf("Iterative Goroutine (Re-calc): All lengths tested. Overall Best Profit: %.2f%%. Path Len: %d\n", g.overallBestSolutionInIterativeRun.Profit*100, len(g.overallBestSolutionInIterativeRun.Path))
-							}
-							// g.overallBestSolutionInIterativeRun now holds the true overall best.
-							g.finalBestSolution = g.overallBestSolutionInIterativeRun
-							if g.finalBestSolution.Profit < 0 {
-								g.finalBestSolution.Grid = g.roadLayoutGrid
-								g.finalBestSolution.Path = nil
-							}
+						fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d) finished.\n", masterCalcID)
+						g.gameState = StateShowingResult
+						g.finalBestSolution = g.absoluteBestOverallSolution
+						if g.finalBestSolution.Path == nil { // If no path, reset to road layout
+							g.finalBestSolution.Grid = roadLayout // Assignment copies array
+							// Path already nil
+							g.finalBestSolution.Profit = -1.0
+						}
+						if g.finalBestSolution.Path != nil {
 							g.maxLenUsedForFinalSolution = len(g.finalBestSolution.Path)
-							if !userForcedStop { // Only update main display grid on natural completion
-								g.grid = g.finalBestSolution.Grid
-							}
-							g.intermediateBestSolution = g.finalBestSolution
-
-							if g.stopCalcChannel == stopChan && !userForcedStop {
-								close(g.stopCalcChannel)
-							}
-							g.stopCalcChannel = nil
 						} else {
-							fmt.Println("Goroutine for an older re-calc finished or was preempted. No game state update.")
+							g.maxLenUsedForFinalSolution = 0
+						}
+						if g.finalBestSolution.Path != nil {
+							g.grid = g.finalBestSolution.Grid
+						} else {
+							g.grid = roadLayout // Assignment copies array
+						}
+						if masterStopChan != nil {
+							select {
+							case <-masterStopChan:
+							default:
+								close(masterStopChan)
+							}
+							if g.stopCalcChannel == masterStopChan {
+								g.stopCalcChannel = nil
+							}
 						}
 						g.updateButtonsForState()
 						g.updateCalculationStatus()
-						g.mu.Unlock()
+						fmt.Printf("[DEBUG] Recalculation: Transitioned to StateShowingResult. Final best profit: %.2f%%\n", g.finalBestSolution.Profit*100)
 					}()
 
-				} else {
-					g.calculationStatus = fmt.Sprintf("Cannot re-calc: Original start (%d,%d) invalid. Esc to re-pick.", g.selectedRiverStart.X, g.selectedRiverStart.Y)
-				}
-				g.updateCalculationStatus()
+					if len(initialStarts) == 0 {
+						fmt.Println("[DEBUG] No valid river starts for recalculation.")
+						return
+					}
+					for _, startNode := range initialStarts {
+						select {
+						case <-masterStopChan:
+							fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d): stop signal before worker for %v.\n", masterCalcID, startNode)
+							g.activeCalculationGoroutines.Wait()
+							return
+						default:
+						}
+						g.activeCalculationGoroutines.Add(1)
+						fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d): Launching worker for start %v\n", masterCalcID, startNode)
+						// Pass roadLayout by value (it's an array, so it gets copied)
+						go g.runPathCalculationWorker(startNode, maxLength, masterStopChan, disableAdj, roadLayout, masterCalcID)
+					}
+					fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d): All %d workers launched. Waiting...\n", masterCalcID, len(initialStarts))
+					g.activeCalculationGoroutines.Wait()
+					fmt.Printf("[DEBUG] Master goroutine (RECALC ID %d): Wait finished.\n", masterCalcID)
+				}(g.currentCalculationID, g.stopCalcChannel, g.lengthUsedForCurrentCalculation, g.DisableCrossRiverAdjacency, g.roadLayoutGrid, g.validRiverStarts) // Pass roadLayoutGrid by value
 			},
 		})
 		g.buttons = append(g.buttons, Button{
@@ -956,10 +1069,12 @@ func (g *Game) updateButtonsForState() {
 				g.gameState = StatePlacingRiverSource
 				g.grid = g.roadLayoutGrid // Direct assignment
 				g.validRiverStarts = g.roadLayoutGrid.GetValidRiverStarts()
-				g.intermediateBestSolution.Grid = g.roadLayoutGrid // Direct assignment
-				g.intermediateBestSolution.Path = nil
-				g.intermediateBestSolution.Profit = -1.0
-				g.finalBestSolution = g.intermediateBestSolution // Clear previous final solution
+				// g.intermediateBestSolution.Grid = g.roadLayoutGrid // Direct assignment // REMOVED
+				// g.intermediateBestSolution.Path = nil // REMOVED
+				// g.intermediateBestSolution.Profit = -1.0 // REMOVED
+				// g.finalBestSolution = g.intermediateBestSolution // Clear previous final solution // REMOVED
+				g.finalBestSolution = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
+				g.absoluteBestOverallSolution = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
 				g.maxLenUsedForFinalSolution = 0
 				g.selectedRiverStart = game.Coordinate{} // Clear selected start
 				fmt.Println("Returning to River Source Selection.")
@@ -976,7 +1091,8 @@ func (g *Game) updateButtonsForState() {
 				g.finalBestSolution.Grid = g.grid // Reset solutions
 				g.finalBestSolution.Path = nil
 				g.finalBestSolution.Profit = -1.0
-				g.intermediateBestSolution = g.finalBestSolution
+				// g.intermediateBestSolution = g.finalBestSolution // REMOVED
+				g.absoluteBestOverallSolution = g.finalBestSolution // Also reset this one
 				g.maxLenUsedForFinalSolution = 0
 				g.validRiverStarts = nil
 				g.selectedRiverStart = game.Coordinate{}
@@ -1011,11 +1127,11 @@ func (g *Game) resetButtonAction(resetType string) {
 		}
 		// Set the game's reference to nil. The goroutine has its own copy.
 		g.stopCalcChannel = nil
-		fmt.Printf("Calculation stopped due to %s Reset.\\n", resetType)
+		fmt.Printf("Calculation stopped due to %s Reset.\n", resetType)
 	}
 
 	// Part 2: Reset game state fields
-	fmt.Printf("Resetting game to %s state.\\n", resetType)
+	fmt.Printf("Resetting game to %s state.\n", resetType)
 
 	switch resetType {
 	case "Full":
@@ -1028,30 +1144,32 @@ func (g *Game) resetButtonAction(resetType string) {
 		g.DisableCrossRiverAdjacency = false
 
 		// Reset solution holders, ensuring their grids point to the new empty grid
-		newEmptySolution := game.RiverPathSolution{Grid: g.grid, Profit: -1.0, Path: nil}
+		newEmptySolution := game.RiverPathSolution{Grid: game.NewGrid(), Profit: -1.0, Path: nil} // Use NewGrid() for array type
 		g.finalBestSolution = newEmptySolution
-		g.intermediateBestSolution = newEmptySolution
-		g.overallBestSolutionInIterativeRun = newEmptySolution
+		// g.intermediateBestSolution = newEmptySolution // REMOVED
+		// g.overallBestSolutionInIterativeRun = newEmptySolution // REMOVED
+		g.absoluteBestOverallSolution = newEmptySolution
 
 		g.validRiverStarts = nil
 		g.selectedRiverStart = game.Coordinate{}
-		g.isIterativeCalculationActive = false // Reset iterative calculation state
-		g.currentLengthBeingTested = 0
+		// g.isIterativeCalculationActive = false // Reset iterative calculation state // REMOVED
+		// g.currentLengthBeingTested = 0 // REMOVED
 
 	case "ToRiverSource": // This case might be less used or need similar care if callable during calculation
 		// Assuming this is typically called when not actively calculating, or the stop channel logic above handles it.
 		g.gameState = StatePlacingRiverSource
 		g.grid = g.roadLayoutGrid // Show the road layout
 		g.validRiverStarts = g.roadLayoutGrid.GetValidRiverStarts()
-
-		cleanSolutionForSource := game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
-		g.intermediateBestSolution = cleanSolutionForSource
-		g.finalBestSolution = cleanSolutionForSource
-		g.overallBestSolutionInIterativeRun = cleanSolutionForSource
+		// g.intermediateBestSolution.Grid = g.roadLayoutGrid // REMOVED
+		// g.intermediateBestSolution.Path = nil // REMOVED
+		// g.finalBestSolution = g.intermediateBestSolution // REMOVED
+		// For array types, assignment copies. Ensure Profit and Path indicate it's reset.
+		g.finalBestSolution = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
+		g.absoluteBestOverallSolution = game.RiverPathSolution{Grid: g.roadLayoutGrid, Profit: -1.0, Path: nil}
 
 		g.maxLenUsedForFinalSolution = 0
-		g.isIterativeCalculationActive = false // Reset iterative calculation state
-		g.currentLengthBeingTested = 0
+		// g.isIterativeCalculationActive = false // Reset iterative calculation state // REMOVED
+		// g.currentLengthBeingTested = 0 // REMOVED
 		// selectedRiverStart is intentionally NOT cleared here, as user might want to reuse previous start if coming from results
 		// However, for a general "ToRiverSource" reset, clearing it might be more consistent.
 		// For now, matching existing behavior where it might persist from a previous calculation context.
@@ -1232,8 +1350,8 @@ func (g *Game) handleDetectRoadFromImage() {
 	g.finalBestSolution.Grid = g.grid
 	g.finalBestSolution.Profit = -1.0
 	g.finalBestSolution.Path = nil
-	g.intermediateBestSolution = g.finalBestSolution
-	g.overallBestSolutionInIterativeRun = game.RiverPathSolution{Grid: g.grid, Profit: -1.0, Path: nil}
+	// g.intermediateBestSolution = g.finalBestSolution // REMOVED
+	g.absoluteBestOverallSolution = game.RiverPathSolution{Grid: g.grid, Profit: -1.0, Path: nil}
 
 	log.Printf("Detected %d road tiles from image.", len(detectedRoadTiles))
 	g.calculationStatus = fmt.Sprintf("Detected %d road tiles. Finalize or edit.", len(detectedRoadTiles))
@@ -1300,8 +1418,8 @@ func (g *Game) processDetectedImage(fullImg image.Image, sourceDescription strin
 	g.finalBestSolution.Grid = g.grid
 	g.finalBestSolution.Profit = -1.0
 	g.finalBestSolution.Path = nil
-	g.intermediateBestSolution = g.finalBestSolution
-	g.overallBestSolutionInIterativeRun = game.RiverPathSolution{Grid: g.grid, Profit: -1.0, Path: nil}
+	// g.intermediateBestSolution = g.finalBestSolution // REMOVED
+	g.absoluteBestOverallSolution = game.RiverPathSolution{Grid: g.grid, Profit: -1.0, Path: nil}
 
 	log.Printf("Detected %d road tiles from %s.", len(detectedRoadTiles), sourceDescription)
 	g.calculationStatus = fmt.Sprintf("Detected %d road tiles from %s. Finalize or edit.", len(detectedRoadTiles), sourceDescription)
@@ -1404,6 +1522,15 @@ func min(a, b int) int {
 }
 
 func main() {
+	// Set GOMAXPROCS
+	numCPU := runtime.NumCPU()
+	gomaxprocs := numCPU / 2
+	if gomaxprocs < 1 {
+		gomaxprocs = 1
+	}
+	runtime.GOMAXPROCS(gomaxprocs)
+	log.Printf("GOMAXPROCS set to %d (available CPU cores: %d)", gomaxprocs, numCPU)
+
 	ebiten.SetWindowSize(screenWidth, screenHeight)
 	ebiten.SetWindowTitle("River Plan Optimizer")
 

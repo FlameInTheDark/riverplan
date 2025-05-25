@@ -273,52 +273,8 @@ func exploreAndEvaluateRecursive(grid *Grid, currentTile Coordinate, currentPath
 			// Score and sort moves
 			scoredMoves := make([]ScoredMove, 0, len(currentConsiderationSet))
 
-			var dxPrev, dyPrev int
-			hasPrevDirection := false
-			if len(pathWithCurrentTile) >= 2 {
-				parentTile := pathWithCurrentTile[len(pathWithCurrentTile)-2]
-				dxPrev = currentTile.X - parentTile.X
-				dyPrev = currentTile.Y - parentTile.Y
-				hasPrevDirection = true
-			}
-
 			for _, choice := range currentConsiderationSet {
-				isStraight := false
-				if hasPrevDirection {
-					dxNext := choice.X - currentTile.X
-					dyNext := choice.Y - currentTile.Y
-					if dxNext == dxPrev && dyNext == dyPrev {
-						isStraight = true
-					}
-				}
-
-				adjacencyBonus := 0
-				// Calculate adjacency bonus for this 'choice'
-				// Potential forest spots are neighbors of 'choice' that are 'Empty'
-				choiceNeighbors := []Coordinate{
-					{X: choice.X, Y: choice.Y - 1}, {X: choice.X, Y: choice.Y + 1},
-					{X: choice.X - 1, Y: choice.Y}, {X: choice.X + 1, Y: choice.Y},
-				}
-				for _, pForest := range choiceNeighbors {
-					if grid.isValidCoordinate(pForest) && grid[pForest.Y][pForest.X] == Empty {
-						// Now, count how many segments of pathWithCurrentTile (excluding 'choice' itself, but including currentTile)
-						// this pForest is adjacent to.
-						for _, riverSegInPath := range pathWithCurrentTile { // pathWithCurrentTile includes currentTile
-							if (abs(pForest.X-riverSegInPath.X) == 1 && pForest.Y == riverSegInPath.Y) ||
-								(abs(pForest.Y-riverSegInPath.Y) == 1 && pForest.X == riverSegInPath.X) {
-								adjacencyBonus++
-							}
-						}
-					}
-				}
-
-				newForestCount := 0
-				for _, pForest := range choiceNeighbors { // Re-use choiceNeighbors for this count
-					if grid.isValidCoordinate(pForest) && grid[pForest.Y][pForest.X] == Empty {
-						newForestCount++
-					}
-				}
-
+				isStraight, adjacencyBonus, newForestCount := calculateScoreWithLookahead(grid, choice, currentTile, pathWithCurrentTile, disableCrossRiverAdjacency)
 				scoredMoves = append(scoredMoves, ScoredMove{Coord: choice, IsStraight: isStraight, AdjacencyBonus: adjacencyBonus, NewForestTilesCount: newForestCount})
 			}
 
@@ -386,6 +342,155 @@ func abs(x int) int {
 		return -x
 	}
 	return x
+}
+
+// calculateScoreWithLookahead calculates the heuristic scores for a potential next move,
+// incorporating a 1-step lookahead.
+// It returns: isStraight, adjacencyBonus, newForestTilesCount
+func calculateScoreWithLookahead(grid *Grid, choice Coordinate, currentTile Coordinate, pathWithCurrentTile []Coordinate, disableCrossRiverAdjacency bool) (bool, int, int) {
+	// 1. Determine if 'choice' is a straight move
+	isStraight := false
+	if len(pathWithCurrentTile) >= 1 { // Need at least one previous tile (currentTile) in path to determine direction
+		// The actual path passed to exploreAndEvaluateRecursive for the *next* step is pathWithCurrentTile.
+		// So, to check if 'choice' is straight *from* currentTile, we need the tile *before* currentTile.
+		if len(pathWithCurrentTile) >= 2 {
+			grandParentTile := pathWithCurrentTile[len(pathWithCurrentTile)-2] // Tile before currentTile
+			dxPrev := currentTile.X - grandParentTile.X
+			dyPrev := currentTile.Y - grandParentTile.Y
+			dxNext := choice.X - currentTile.X
+			dyNext := choice.Y - currentTile.Y
+			if dxNext == dxPrev && dyNext == dyPrev {
+				isStraight = true
+			}
+		} else {
+			// If len(pathWithCurrentTile) is 1, it means pathWithCurrentTile only contains the river start.
+			// currentTile is the river start. 'choice' is the first segment. Any first segment is not "straight" by this definition.
+			isStraight = false
+		}
+	}
+
+	// 2. Calculate immediate adjacency bonus and new forest count for 'choice'
+	immediateAdjacencyBonus := 0
+	immediateNewForestCount := 0
+	choiceNeighbors := []Coordinate{
+		{X: choice.X, Y: choice.Y - 1}, {X: choice.X, Y: choice.Y + 1},
+		{X: choice.X - 1, Y: choice.Y}, {X: choice.X + 1, Y: choice.Y},
+	}
+	pathIncludingChoice := append(pathWithCurrentTile, choice) // Path up to and including 'choice'
+
+	for _, pForest := range choiceNeighbors {
+		if grid.isValidCoordinate(pForest) && grid[pForest.Y][pForest.X] == Empty {
+			immediateNewForestCount++
+			// Adjacency to existing path (pathWithCurrentTile) + 'choice' itself
+			for _, riverSegInPath := range pathIncludingChoice {
+				if (abs(pForest.X-riverSegInPath.X) == 1 && pForest.Y == riverSegInPath.Y) ||
+					(abs(pForest.Y-riverSegInPath.Y) == 1 && pForest.X == riverSegInPath.X) {
+					immediateAdjacencyBonus++
+				}
+			}
+		}
+	}
+
+	// 3. Perform 1-step lookahead
+	bestLookaheadAdjacencyBonus := 0
+	bestLookaheadNewForestCount := 0
+
+	// Simulate placing 'choice'
+	originalChoiceTileState := grid[choice.Y][choice.X]
+	grid[choice.Y][choice.X] = River // Temporarily place 'choice' for lookahead
+
+	lookaheadPotentialNeighbors := []Coordinate{
+		{X: choice.X, Y: choice.Y - 1}, {X: choice.X, Y: choice.Y + 1},
+		{X: choice.X - 1, Y: choice.Y}, {X: choice.X + 1, Y: choice.Y},
+	}
+
+	for _, lookaheadNextTile := range lookaheadPotentialNeighbors {
+		// Basic validation for lookaheadNextTile
+		if !grid.isValidCoordinate(lookaheadNextTile) || grid[lookaheadNextTile.Y][lookaheadNextTile.X] != Empty {
+			continue
+		}
+
+		// U-turn prevention for lookaheadNextTile (relative to 'choice' and 'currentTile')
+		// Path for this check is pathWithCurrentTile -> choice -> lookaheadNextTile
+		// 'currentTile' is pathWithCurrentTile[len(pathWithCurrentTile)-1] if path is not empty
+		if len(pathWithCurrentTile) > 0 { // currentTile is meaningful
+			if lookaheadNextTile.X == pathWithCurrentTile[len(pathWithCurrentTile)-1].X &&
+				lookaheadNextTile.Y == pathWithCurrentTile[len(pathWithCurrentTile)-1].Y {
+				continue // Lookahead U-turn to currentTile
+			}
+		}
+
+		// Cross Adjacency Check for lookaheadNextTile (if enabled)
+		if disableCrossRiverAdjacency {
+			isCrossAdjacent := false
+			potentialCrossAdjacents := []Coordinate{
+				{X: lookaheadNextTile.X, Y: lookaheadNextTile.Y - 1}, {X: lookaheadNextTile.X, Y: lookaheadNextTile.Y + 1},
+				{X: lookaheadNextTile.X - 1, Y: lookaheadNextTile.Y}, {X: lookaheadNextTile.X + 1, Y: lookaheadNextTile.Y},
+			}
+			for _, adjToNext := range potentialCrossAdjacents {
+				if adjToNext.X == choice.X && adjToNext.Y == choice.Y { // Don't check against the immediate parent ('choice')
+					continue
+				}
+				// Check against the rest of the path (pathWithCurrentTile) and 'choice' itself
+				// Since 'choice' is already on the grid, checking grid[...]==River is sufficient
+				if grid.isValidCoordinate(adjToNext) && grid[adjToNext.Y][adjToNext.X] == River {
+					isCrossAdjacent = true
+					break
+				}
+			}
+			if isCrossAdjacent {
+				continue
+			}
+		}
+
+		// Calculate hypothetical scores for lookaheadNextTile
+		currentLookaheadAdjBonus := 0
+		currentLookaheadNewForests := 0
+		lookaheadChoiceNeighbors := []Coordinate{
+			{X: lookaheadNextTile.X, Y: lookaheadNextTile.Y - 1}, {X: lookaheadNextTile.X, Y: lookaheadNextTile.Y + 1},
+			{X: lookaheadNextTile.X - 1, Y: lookaheadNextTile.Y}, {X: lookaheadNextTile.X + 1, Y: lookaheadNextTile.Y},
+		}
+		// pathIncludingLookahead := append(pathIncludingChoice, lookaheadNextTile) // Path up to 'lookaheadNextTile'
+
+		for _, pForest := range lookaheadChoiceNeighbors {
+			if grid.isValidCoordinate(pForest) && grid[pForest.Y][pForest.X] == Empty { // Check Empty, as 'choice' is on grid, but 'lookaheadNextTile' is not yet.
+				// If pForest is where 'choice' is, it's not empty.
+				// We need to be careful if pForest is the same as 'choice'.
+				// However, a forest cannot be on a river tile.
+				// The condition grid[pForest.Y][pForest.X] == Empty handles this.
+
+				currentLookaheadNewForests++
+				// Adjacency to existing path (pathIncludingChoice) + 'lookaheadNextTile' itself
+				// Check adjacency to 'choice'
+				if (abs(pForest.X-choice.X) == 1 && pForest.Y == choice.Y) || (abs(pForest.Y-choice.Y) == 1 && pForest.X == choice.X) {
+					currentLookaheadAdjBonus++
+				}
+				// Check adjacency to pathWithCurrentTile
+				for _, riverSegInPath := range pathWithCurrentTile {
+					if (abs(pForest.X-riverSegInPath.X) == 1 && pForest.Y == riverSegInPath.Y) ||
+						(abs(pForest.Y-riverSegInPath.Y) == 1 && pForest.X == riverSegInPath.X) {
+						currentLookaheadAdjBonus++
+					}
+				}
+			}
+		}
+
+		// Simple way to combine: sum them up. Could be weighted.
+		if currentLookaheadAdjBonus+currentLookaheadNewForests > bestLookaheadAdjacencyBonus+bestLookaheadNewForestCount {
+			bestLookaheadAdjacencyBonus = currentLookaheadAdjBonus
+			bestLookaheadNewForestCount = currentLookaheadNewForests
+		}
+	}
+
+	// Revert 'choice' from grid
+	grid[choice.Y][choice.X] = originalChoiceTileState
+
+	// Combine immediate scores with best lookahead scores
+	// For now, simple addition. Could be weighted (e.g., lookahead scores discounted by 0.5)
+	totalAdjacencyBonus := immediateAdjacencyBonus + bestLookaheadAdjacencyBonus
+	totalNewForestTilesCount := immediateNewForestCount + bestLookaheadNewForestCount
+
+	return isStraight, totalAdjacencyBonus, totalNewForestTilesCount
 }
 
 // calculateProfitAndPlaceForests places Forest tiles ONLY in Empty spots adjacent to the river,
